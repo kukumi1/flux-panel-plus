@@ -1,0 +1,7 @@
+.git
+*.exe
+*.test
+*.out
+app-*
+go-backend
+logs

@@ -1,0 +1,106 @@
+package pkg
+
+import (
+	"flux-panel/go-backend/dto"
+	"flux-panel/go-backend/model"
+)
+
+func XrayStart(nodeId int64) *dto.GostResponse {
+	return WS.SendMsg(nodeId, map[string]interface{}{}, "VStart")
+}
+
+func XrayStop(nodeId int64) *dto.GostResponse {
+	return WS.SendMsg(nodeId, map[string]interface{}{}, "VStop")
+}
+
+func XrayRestart(nodeId int64) *dto.GostResponse {
+	return WS.SendMsg(nodeId, map[string]interface{}{}, "VRestart")
+}
+
+func XrayStatus(nodeId int64) *dto.GostResponse {
+	return WS.SendMsg(nodeId, map[string]interface{}{}, "VStatus")
+}
+
+func XrayAddInbound(nodeId int64, inbound *model.XrayInbound) *dto.GostResponse {
+	data := map[string]interface{}{
+		"tag":                inbound.Tag,
+		"protocol":           inbound.Protocol,
+		"listen":             inbound.Listen,
+		"port":               inbound.Port,
+		"settingsJson":       inbound.SettingsJson,
+		"streamSettingsJson": inbound.StreamSettingsJson,
+		"sniffingJson":       inbound.SniffingJson,
+	}
+	return WS.SendMsg(nodeId, data, "VAddInbound")
+}
+
+func XrayRemoveInbound(nodeId int64, tag string) *dto.GostResponse {
+	data := map[string]interface{}{
+		"tag": tag,
+	}
+	return WS.SendMsg(nodeId, data, "VRemoveInbound")
+}
+
+func XrayAddClient(nodeId int64, inboundTag, email, uuidOrPassword, flow string, alterId int, protocol string) *dto.GostResponse {
+	data := map[string]interface{}{
+		"inboundTag":     inboundTag,
+		"email":          email,
+		"uuidOrPassword": uuidOrPassword,
+		"flow":           flow,
+		"alterId":        alterId,
+		"protocol":       protocol,
+	}
+	return WS.SendMsg(nodeId, data, "VAddClient")
+}
+
+func XrayRemoveClient(nodeId int64, inboundTag, email string) *dto.GostResponse {
+	data := map[string]interface{}{
+		"inboundTag": inboundTag,
+		"email":      email,
+	}
+	return WS.SendMsg(nodeId, data, "VRemoveClient")
+}
+
+func XrayGetTraffic(nodeId int64) *dto.GostResponse {
+	data := map[string]interface{}{
+		"reset": true,
+	}
+	return WS.SendMsg(nodeId, data, "VGetTraffic")
+}
+
+func XrayApplyConfig(nodeId int64, inbounds []model.XrayInbound) *dto.GostResponse {
+	var arr []map[string]interface{}
+	for _, ib := range inbounds {
+		arr = append(arr, map[string]interface{}{
+			"tag":                ib.Tag,
+			"protocol":           ib.Protocol,
+			"listen":             ib.Listen,
+			"port":               ib.Port,
+			"settingsJson":       ib.SettingsJson,
+			"streamSettingsJson": ib.StreamSettingsJson,
+			"sniffingJson":       ib.SniffingJson,
+		})
+	}
+	data := map[string]interface{}{
+		"inbounds": arr,
+	}
+	return WS.SendMsg(nodeId, data, "VApplyConfig")
+}
+
+func XraySwitchVersion(nodeId int64, version string) *dto.GostResponse {
+	data := map[string]interface{}{"version": version}
+	return WS.SendMsg(nodeId, data, "VSwitchVersion")
+}
+
+func XrayGetInboundTags(nodeId int64) *dto.GostResponse {
+	return WS.SendMsg(nodeId, nil, "VGetInboundTags")
+}
+
+func XrayDeployCert(nodeId int64, domain, publicKey, privateKey string) *dto.GostResponse {
+	data := map[string]interface{}{
+		"domain":     domain,
+		"publicKey":  publicKey,
+		"privateKey": privateKey,
+	}
+	return WS.SendMsg(nodeId, data, "VDeployCert")
+}

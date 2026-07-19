@@ -1,0 +1,442 @@
+package service
+
+import (
+	"flux-panel/go-backend/config"
+	"flux-panel/go-backend/dto"
+	"flux-panel/go-backend/model"
+	"flux-panel/go-backend/pkg"
+	"fmt"
+	"log"
+	"math/rand"
+	"net/url"
+	"strings"
+	"time"
+)
+
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
+}
+
+func sanitizeContainerName(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	for i, r := range s {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.'
+		if ok {
+			b.WriteRune(r)
+			continue
+		}
+		// Replace unsupported characters to keep generated command valid.
+		if i == 0 {
+			b.WriteRune('a')
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		return ""
+	}
+	first := out[0]
+	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || (first >= '0' && first <= '9')) {
+		out = "a" + out
+	}
+	return out
+}
+
+// disguisePool contains common Linux daemon names used to camouflage node processes.
+var disguisePool = []string{
+	"accounts-daemon", "dbus-broker", "networkd-dispatcher",
+	"udisksd", "packagekitd", "polkitd", "colord-sane",
+	"rtkit-daemon", "upower-daemon", "thermald",
+	"irqbalance", "lldpd", "smartd", "avahi-daemon",
+	"cupsd", "bluetoothd", "ModemManager",
+}
+
+// pickDisguiseNames selects two distinct random names from the disguise pool.
+func pickDisguiseNames() (string, string) {
+	indices := rand.Perm(len(disguisePool))
+	return disguisePool[indices[0]], disguisePool[indices[1]]
+}
+
+func pickOneDisguise(exclude string) string {
+	for _, idx := range rand.Perm(len(disguisePool)) {
+		name := disguisePool[idx]
+		if name != exclude {
+			return name
+		}
+	}
+	return "systemd-helper"
+}
+
+func CreateNode(d dto.NodeDto) dto.R {
+	if d.PortSta >= d.PortEnd {
+		return dto.Err("闁荤姍鍐ㄦЩ妞ゎ偅鍔楃划鈺咁敍濮橆剛绋夐棅顐㈡搐閹虫﹢濡磋箛鏇氱剨闊洤娴烽懝鍓х磽娴ｈ灏版繛纰卞亞缁晠顢涘顒傜▔")
+	}
+
+	disguise, xrayDisguise := pickDisguiseNames()
+
+	node := model.Node{
+		Name:             d.Name,
+		Ip:               d.Ip,
+		EntryIps:         d.EntryIps,
+		ServerIp:         d.ServerIp,
+		PortSta:          d.PortSta,
+		PortEnd:          d.PortEnd,
+		Secret:           pkg.GenerateSecureSecret(),
+		Status:           0,
+		GroupName:        d.GroupName,
+		CreatedTime:      time.Now().UnixMilli(),
+		UpdatedTime:      time.Now().UnixMilli(),
+		DisguiseName:     disguise,
+		XrayDisguiseName: xrayDisguise,
+	}
+
+	if err := DB.Create(&node).Error; err != nil {
+		return dto.Err("node not found")
+	}
+	return dto.Ok(node)
+}
+
+func GetAllNodes() dto.R {
+	var nodes []model.Node
+	DB.Order("inx ASC, created_time DESC").Find(&nodes)
+
+	result := make([]map[string]interface{}, 0, len(nodes))
+	for _, n := range nodes {
+		status := n.Status
+		if pkg.WS != nil && pkg.WS.IsNodeOnline(n.ID) {
+			status = 1
+		}
+
+		item := map[string]interface{}{
+			"id":          n.ID,
+			"name":        n.Name,
+			"ip":          n.Ip,
+			"entryIps":    n.EntryIps,
+			"serverIp":    n.ServerIp,
+			"portSta":     n.PortSta,
+			"portEnd":     n.PortEnd,
+			"secret":      n.Secret,
+			"version":     n.Version,
+			"http":        n.Http,
+			"tls":         n.Tls,
+			"socks":       n.Socks,
+			"xrayEnabled": n.XrayEnabled,
+			"xrayVersion": n.XrayVersion,
+			"xrayStatus":  n.XrayStatus,
+			// Frontend expects vVersion/vStatus
+			"vVersion":         n.XrayVersion,
+			"vStatus":          n.XrayStatus,
+			"createdTime":      n.CreatedTime,
+			"updatedTime":      n.UpdatedTime,
+			"status":           status,
+			"inx":              n.Inx,
+			"groupName":        n.GroupName,
+			"disguiseName":     n.DisguiseName,
+			"xrayDisguiseName": n.XrayDisguiseName,
+		}
+
+		// Overlay live system info from WS cache
+		if pkg.WS != nil {
+			if info := pkg.WS.GetNodeSystemInfo(n.ID); info != nil {
+				item["cpuUsage"] = info.CPUUsage
+				item["memUsage"] = info.MemoryUsage
+				item["uptime"] = info.Uptime
+				item["bytesReceived"] = info.BytesReceived
+				item["bytesTransmitted"] = info.BytesTransmitted
+				item["interfaces"] = info.Interfaces
+				item["runtime"] = info.Runtime
+				item["singBoxAudit"] = info.SingBoxAudit
+				item["panelAddr"] = info.PanelAddr
+				item["vRunning"] = info.XrayRunning
+				if info.XrayVersion != "" {
+					item["xrayVersion"] = info.XrayVersion
+					item["vVersion"] = info.XrayVersion
+				}
+			}
+		}
+
+		result = append(result, item)
+	}
+
+	return dto.Ok(result)
+}
+
+func UpdateNode(d dto.NodeUpdateDto) dto.R {
+	var node model.Node
+	if err := DB.First(&node, d.ID).Error; err != nil {
+		return dto.Err("node not found")
+	}
+
+	updates := map[string]interface{}{
+		"updated_time": time.Now().UnixMilli(),
+	}
+
+	if d.Name != "" {
+		updates["name"] = d.Name
+	}
+	if d.Ip != "" {
+		updates["ip"] = d.Ip
+	}
+	// EntryIps can be set to empty string to clear, so always update if present in request
+	updates["entry_ips"] = d.EntryIps
+	if d.ServerIp != "" {
+		oldServerIp := node.ServerIp
+		updates["server_ip"] = d.ServerIp
+
+		// Update tunnel IPs if server IP changed
+		if oldServerIp != d.ServerIp {
+			DB.Model(&model.Tunnel{}).Where("in_node_id = ?", d.ID).Update("in_ip", d.ServerIp)
+			DB.Model(&model.Tunnel{}).Where("out_node_id = ?", d.ID).Update("out_ip", d.ServerIp)
+		}
+	}
+	if d.PortSta != nil {
+		updates["port_sta"] = *d.PortSta
+	}
+	if d.PortEnd != nil {
+		updates["port_end"] = *d.PortEnd
+	}
+	if d.GroupName != nil {
+		updates["group_name"] = *d.GroupName
+	}
+
+	if err := DB.Model(&node).Updates(updates).Error; err != nil {
+		return dto.Err("node not found")
+	}
+	return dto.Ok("node updated")
+}
+
+func SetNodeProtocol(d dto.NodeSetProtocolDto) dto.R {
+	var node model.Node
+	if err := DB.First(&node, d.ID).Error; err != nil {
+		return dto.Err("node not found")
+	}
+
+	// Update DB
+	if err := DB.Model(&node).Updates(map[string]interface{}{
+		"http":         d.Http,
+		"tls":          d.Tls,
+		"socks":        d.Socks,
+		"updated_time": time.Now().UnixMilli(),
+	}).Error; err != nil {
+		return dto.Err("node not found")
+	}
+
+	// Push to node via WebSocket if online
+	if pkg.WS != nil && pkg.WS.IsNodeOnline(d.ID) {
+		resp := pkg.WS.SendMsg(d.ID, map[string]interface{}{
+			"http":  d.Http,
+			"tls":   d.Tls,
+			"socks": d.Socks,
+		}, "SetProtocol")
+		if resp != nil && resp.Msg != "OK" {
+			log.Printf("SetProtocol push to node %d: %s", d.ID, resp.Msg)
+			return dto.Ok("閻庤鐡曞鎾舵崲濮樻墎鍋撳☉娆欏叕缂佽鲸绻冮幏鍛村幢濡缚鍚傞梻渚囧亗缁€渚€宕哄畝鍕殟闁稿本绮屾禒顖氼熆閹壆绨块悷? " + resp.Msg)
+		}
+	}
+
+	return dto.Ok("node updated")
+}
+
+func DeleteNode(id int64) dto.R {
+	var node model.Node
+	if err := DB.First(&node, id).Error; err != nil {
+		return dto.Err("node not found")
+	}
+
+	// Check if node is used by any tunnel
+	var count int64
+	DB.Model(&model.Tunnel{}).Where("in_node_id = ? OR out_node_id = ?", id, id).Count(&count)
+	if count > 0 {
+		return dto.Err("node not found")
+	}
+
+	// Cascade cleanup: Xray inbounds + their clients (best-effort hot-remove)
+	var inbounds []model.XrayInbound
+	DB.Where("node_id = ?", id).Find(&inbounds)
+	for _, ib := range inbounds {
+		pkg.XrayRemoveInbound(id, ib.Tag)
+		DB.Where("inbound_id = ?", ib.ID).Delete(&model.XrayClient{})
+	}
+	DB.Where("node_id = ?", id).Delete(&model.XrayInbound{})
+
+	// Cascade cleanup: Xray TLS certs
+	DB.Where("node_id = ?", id).Delete(&model.XrayTlsCert{})
+
+	// Cascade cleanup: user_node records
+	DB.Where("node_id = ?", id).Delete(&model.UserNode{})
+
+	DB.Delete(&node)
+	return dto.Ok("node updated")
+}
+
+func UpdateNodeOrder(items []dto.OrderItem) dto.R {
+	for _, item := range items {
+		DB.Model(&model.Node{}).Where("id = ?", item.ID).Update("inx", item.Inx)
+	}
+	return dto.Ok("node updated")
+}
+
+func GetUserAccessibleNodes(userId int64, roleId int, xrayOnly bool, gostOnly bool) dto.R {
+	var nodes []model.Node
+	if roleId == 0 {
+		// Admin: return all nodes
+		DB.Order("inx ASC, created_time DESC").Find(&nodes)
+	} else {
+		// Check if user has any user_node records
+		var total int64
+		DB.Model(&model.UserNode{}).Where("user_id = ?", userId).Count(&total)
+		if total == 0 {
+			// Legacy user with no records: return all nodes
+			DB.Order("inx ASC, created_time DESC").Find(&nodes)
+		} else {
+			query := DB.Model(&model.UserNode{}).Select("node_id").Where("user_id = ?", userId)
+			if xrayOnly {
+				query = query.Where("xray_enabled = 1")
+			}
+			if gostOnly {
+				query = query.Where("gost_enabled = 1")
+			}
+			DB.Where("id IN (?)", query).Order("inx ASC, created_time DESC").Find(&nodes)
+		}
+	}
+
+	result := make([]map[string]interface{}, 0, len(nodes))
+	for _, n := range nodes {
+		status := n.Status
+		if pkg.WS != nil && pkg.WS.IsNodeOnline(n.ID) {
+			status = 1
+		}
+		item := map[string]interface{}{
+			"id":       n.ID,
+			"name":     n.Name,
+			"entryIps": n.EntryIps,
+			"status":   status,
+		}
+		if pkg.WS != nil {
+			if info := pkg.WS.GetNodeSystemInfo(n.ID); info != nil {
+				item["interfaces"] = info.Interfaces
+			}
+		}
+		result = append(result, item)
+	}
+	return dto.Ok(result)
+}
+
+func GetNodeById(id int64) *model.Node {
+	var node model.Node
+	if err := DB.First(&node, id).Error; err != nil {
+		return nil
+	}
+	return &node
+}
+
+func GenerateInstallCommand(id int64, clientAddr string) dto.R {
+	var node model.Node
+	if err := DB.First(&node, id).Error; err != nil {
+		return dto.Err("node not found")
+	}
+
+	panelAddr := GetPanelAddress(clientAddr)
+
+	cmd := fmt.Sprintf("curl -fsSL %s/s/%s/init | bash",
+		panelAddr, node.Secret)
+
+	return dto.Ok(cmd)
+}
+
+func GenerateLiteInstallCommand(id int64, clientAddr string) dto.R {
+	var node model.Node
+	if err := DB.First(&node, id).Error; err != nil {
+		return dto.Err("node not found")
+	}
+
+	panelAddr := GetPanelAddress(clientAddr)
+	cmd := fmt.Sprintf("curl -fsSL %s/s/%s/init-lite?panel=%s | sh", panelAddr, node.Secret, url.QueryEscape(panelAddr))
+	return dto.Ok(cmd)
+}
+func GenerateDockerInstallCommand(id int64, clientAddr string) dto.R {
+	var node model.Node
+	if err := DB.First(&node, id).Error; err != nil {
+		return dto.Err("node not found")
+	}
+
+	// Backfill legacy nodes: ensure docker path uses randomized disguise names
+	// consistent with bare-metal behavior.
+	updates := map[string]interface{}{}
+	if node.DisguiseName == "" && node.XrayDisguiseName == "" {
+		a, b := pickDisguiseNames()
+		node.DisguiseName = a
+		node.XrayDisguiseName = b
+		updates["disguise_name"] = a
+		updates["xray_disguise_name"] = b
+	} else {
+		if node.DisguiseName == "" {
+			node.DisguiseName = pickOneDisguise(node.XrayDisguiseName)
+			updates["disguise_name"] = node.DisguiseName
+		}
+		if node.XrayDisguiseName == "" {
+			node.XrayDisguiseName = pickOneDisguise(node.DisguiseName)
+			updates["xray_disguise_name"] = node.XrayDisguiseName
+		}
+	}
+	if len(updates) > 0 {
+		updates["updated_time"] = time.Now().UnixMilli()
+		_ = DB.Model(&node).Updates(updates).Error
+	}
+
+	panelAddr := GetPanelAddress(clientAddr)
+
+	imageTag := pkg.Version
+	if imageTag == "" || imageTag == "dev" {
+		imageTag = "latest"
+	}
+	imageRef := fmt.Sprintf("%s/node:%s", containerRegistry, imageTag)
+	appName := node.DisguiseName
+	secName := node.XrayDisguiseName
+	containerName := sanitizeContainerName(appName)
+	if containerName == "" {
+		containerName = fmt.Sprintf("svc-agent-%d", node.ID)
+	}
+	labelValue := fmt.Sprintf("n-%d", node.ID)
+	secCfg := "agent.json"
+	nameEnv := ""
+	nameEnv += fmt.Sprintf(" -e APP_NAME=%s", shQuote(appName))
+	nameEnv += fmt.Sprintf(" -e SEC_NAME=%s", shQuote(secName))
+	nameEnv += fmt.Sprintf(" -e SEC_CFG=%s", shQuote(secCfg))
+	cmd := fmt.Sprintf(`ids="$( { docker ps -aq --filter label=app.scope=%s; docker ps -aq --filter name=^/flux-node$; docker ps -aq --filter name=^/%s$; } | sort -u )"; if [ -n "$ids" ]; then docker rm -f $ids; fi; mkdir -p ~/.flux && docker run -d --name %s --label app.scope=%s --restart unless-stopped --network host -v ~/.flux:/etc/node -v /var/log/sing-box:/var/log/sing-box:ro -e PANEL_ADDR=%s -e SECRET=%s%s %s`,
+		shQuote(labelValue), containerName, shQuote(containerName), shQuote(labelValue), shQuote(panelAddr), shQuote(node.Secret), nameEnv, shQuote(imageRef))
+
+	return dto.Ok(cmd)
+}
+
+// getPanelAddress returns the panel address with priority:
+// 1. vite_config panel_addr (admin explicitly configured)
+// 2. clientAddr from frontend (window.location.origin)
+// 3. fallback to localhost
+func GetPanelAddress(clientAddr string) string {
+	var cfg model.ViteConfig
+	if err := DB.Where("name = ?", "panel_addr").First(&cfg).Error; err == nil && cfg.Value != "" {
+		addr := normalizePanelAddr(cfg.Value)
+		log.Printf("[GetPanelAddress] 婵炶揪缍€濞夋洟寮妶澶婃瀬闁绘鐗嗙粊锕傚箹鐎涙ɑ宕岄柛妯稿€楃槐? %s", addr)
+		return addr
+	}
+	if clientAddr != "" {
+		log.Printf("[GetPanelAddress] 闂佽桨鑳舵晶妤€鐣垫担瑙勫劅闁规儳鐡ㄩ敓?panel_addr闂佹寧绋戞總鏃€绻涢崶顒佸仺?clientAddr: %s", clientAddr)
+		return clientAddr
+	}
+	addr := fmt.Sprintf("http://127.0.0.1:%d", config.Cfg.Port)
+	log.Printf("[GetPanelAddress] fallback: %s", addr)
+	return addr
+}
+
+// normalizePanelAddr ensures the panel address has a scheme (http:// or https://).
+func normalizePanelAddr(addr string) string {
+	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+		return addr
+	}
+	return "http://" + addr
+}

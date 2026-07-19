@@ -1,0 +1,506 @@
+package pkg
+
+import (
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"net/url"
+	"strconv"
+	"sync"
+	"time"
+
+	"flux-panel/go-backend/config"
+	"flux-panel/go-backend/dto"
+
+	"github.com/gorilla/websocket"
+)
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		allowed := config.Cfg.AllowedOrigins
+		if len(allowed) == 0 {
+			return true // No restriction configured 闁?backward compatible
+		}
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true // Non-browser clients (e.g., nodes) have no Origin
+		}
+		for _, o := range allowed {
+			if o == origin {
+				return true
+			}
+		}
+		// Also allow same-origin: compare origin host with request host
+		if reqURL, err := url.Parse(origin); err == nil {
+			if reqURL.Host == r.Host {
+				return true
+			}
+		}
+		log.Printf("WebSocket CheckOrigin rejected origin: %s", origin)
+		return false
+	},
+}
+
+// AdminSession wraps a websocket.Conn with a mutex to prevent concurrent writes.
+type AdminSession struct {
+	Conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+type WSManager struct {
+	nodeSessions    sync.Map // nodeID(int64) 闁?*NodeSession
+	adminSessions   sync.Map // sessionID(string) 闁?*AdminSession
+	pendingRequests sync.Map // requestID(string) 闁?chan *dto.GostResponse
+	nodeSystemInfo  sync.Map // nodeID(int64) 闁?*NodeSystemInfo
+
+	// Callbacks set by the application
+	OnNodeOnline  func(nodeId int64, version, http, tls, socks string)
+	OnNodeOffline func(nodeId int64)
+	OnNodeConfig  func(nodeId int64, data string)
+	// ValidateNodeSecret checks a node's secret. If nodeId > 0, validates
+	// the specific node; if nodeId == 0, looks up by secret alone.
+	// Returns the resolved nodeId (0 = rejected).
+	ValidateNodeSecret func(nodeId int64, secret string) int64
+}
+
+// NetInterface represents a network interface with its name and IP addresses.
+type NetInterface struct {
+	Name string   `json:"name"`
+	IPs  []string `json:"ips"`
+}
+
+type SingBoxAuditInfo struct {
+	LogPath       string `json:"logPath"`
+	LogReadable   bool   `json:"logReadable"`
+	TailerRunning bool   `json:"tailerRunning"`
+	LastEventTime int64  `json:"lastEventTime"`
+	LastErrorTime int64  `json:"lastErrorTime"`
+	LastError     string `json:"lastError"`
+}
+
+// NodeSystemInfo holds the latest system metrics reported by a node.
+type NodeSystemInfo struct {
+	Uptime           uint64           `json:"uptime"`
+	CPUUsage         float64          `json:"cpuUsage"`
+	MemoryUsage      float64          `json:"memUsage"`
+	BytesReceived    uint64           `json:"bytesReceived"`
+	BytesTransmitted uint64           `json:"bytesTransmitted"`
+	XrayRunning      bool             `json:"vRunning"`
+	XrayVersion      string           `json:"vVersion"`
+	Interfaces       []NetInterface   `json:"interfaces"`
+	PanelAddr        string           `json:"panelAddr"`
+	Runtime          string           `json:"runtime"`
+	SingBoxAudit     SingBoxAuditInfo `json:"sing_box_audit"`
+}
+
+// GetNodeSystemInfo returns the latest cached system info for a node, or nil.
+func (m *WSManager) GetNodeSystemInfo(nodeId int64) *NodeSystemInfo {
+	if val, ok := m.nodeSystemInfo.Load(nodeId); ok {
+		return val.(*NodeSystemInfo)
+	}
+	return nil
+}
+
+type NodeSession struct {
+	Conn   *websocket.Conn
+	Secret string
+	mu     sync.Mutex
+}
+
+type EncryptedMessage struct {
+	Encrypted bool   `json:"encrypted"`
+	Data      string `json:"data"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+type WSCommand struct {
+	Type      string      `json:"type"`
+	Data      interface{} `json:"data"`
+	RequestId string      `json:"requestId"`
+}
+
+type WSResponse struct {
+	RequestId string          `json:"requestId"`
+	Message   string          `json:"message"`
+	Type      string          `json:"type"`
+	Data      json.RawMessage `json:"data"`
+}
+
+var WS *WSManager
+
+func InitWSManager() {
+	WS = &WSManager{}
+}
+
+func (m *WSManager) HandleConnection(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	id := q.Get("id")
+	connType := q.Get("type")
+	secret := q.Get("secret")
+
+	var respHeader http.Header
+
+	if connType == "1" {
+		// Node connection 闁?validate secret against DB before upgrading
+		if secret == "" || m.ValidateNodeSecret == nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// If id is provided, validate that specific node; otherwise look up by secret
+		var reqNodeId int64
+		if id != "" {
+			var err error
+			reqNodeId, err = strconv.ParseInt(id, 10, 64)
+			if err != nil {
+				http.Error(w, "Invalid node ID", http.StatusBadRequest)
+				return
+			}
+		}
+		resolvedNodeId := m.ValidateNodeSecret(reqNodeId, secret)
+		if resolvedNodeId == 0 {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// Store resolved ID for use after upgrade
+		id = strconv.FormatInt(resolvedNodeId, 10)
+	} else {
+		// Admin connection 闁?extract JWT
+		// Priority: Sec-WebSocket-Protocol (avoids URL leakage) > query param (backward compat)
+		token := ""
+		selectedSubprotocol := ""
+		for _, sp := range websocket.Subprotocols(r) {
+			if ValidateToken(sp) {
+				token = sp
+				selectedSubprotocol = sp
+				break
+			}
+		}
+		if token == "" {
+			token = secret // fallback to query param
+		}
+		if !ValidateToken(token) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// Echo back the selected subprotocol so the browser handshake succeeds
+		if selectedSubprotocol != "" {
+			respHeader = http.Header{"Sec-WebSocket-Protocol": {selectedSubprotocol}}
+		}
+	}
+
+	conn, err := upgrader.Upgrade(w, r, respHeader)
+	if err != nil {
+		log.Printf("WebSocket upgrade failed: %v", err)
+		return
+	}
+
+	if connType == "1" {
+		// Node connection (already validated above)
+		nodeId, _ := strconv.ParseInt(id, 10, 64)
+
+		version := q.Get("nodeVersion")
+		httpVal := q.Get("http")
+		tlsVal := q.Get("tls")
+		socksVal := q.Get("socks")
+
+		// Close existing session if any
+		if existing, ok := m.nodeSessions.Load(nodeId); ok {
+			old := existing.(*NodeSession)
+			old.Conn.Close()
+		}
+
+		ns := &NodeSession{Conn: conn, Secret: secret}
+		m.nodeSessions.Store(nodeId, ns)
+
+		if m.OnNodeOnline != nil {
+			m.OnNodeOnline(nodeId, version, httpVal, tlsVal, socksVal)
+		}
+
+		go m.readNodeMessages(nodeId, ns)
+	} else {
+		// Admin connection
+		sessionId := conn.RemoteAddr().String()
+		as := &AdminSession{Conn: conn}
+		m.adminSessions.Store(sessionId, as)
+
+		go m.readAdminMessages(sessionId, as)
+	}
+}
+
+func (m *WSManager) readNodeMessages(nodeId int64, ns *NodeSession) {
+	defer func() {
+		// Only update offline if this is still the current session
+		if current, ok := m.nodeSessions.Load(nodeId); ok {
+			if current.(*NodeSession) == ns {
+				m.nodeSessions.Delete(nodeId)
+				m.nodeSystemInfo.Delete(nodeId)
+				if m.OnNodeOffline != nil {
+					m.OnNodeOffline(nodeId)
+				}
+			}
+		}
+		ns.Conn.Close()
+	}()
+
+	for {
+		_, message, err := ns.Conn.ReadMessage()
+		if err != nil {
+			log.Printf("Node %d read error: %v", nodeId, err)
+			return
+		}
+
+		payload := string(message)
+		decrypted := m.decryptIfNeeded(payload, ns.Secret)
+
+		if containsStr(decrypted, "memory_usage") {
+			m.sendToNode(ns, `{"type":"call"}`)
+
+			// Cache latest system info for REST API access
+			var sysInfo struct {
+				Uptime           uint64           `json:"uptime"`
+				CPUUsage         float64          `json:"cpu_usage"`
+				MemoryUsage      float64          `json:"memory_usage"`
+				BytesReceived    uint64           `json:"bytes_received"`
+				BytesTransmitted uint64           `json:"bytes_transmitted"`
+				XrayRunning      bool             `json:"v_running"`
+				XrayVersion      string           `json:"v_version"`
+				PanelAddr        string           `json:"panel_addr"`
+				Runtime          string           `json:"runtime"`
+				SingBoxAudit     SingBoxAuditInfo `json:"sing_box_audit"`
+				Interfaces       []struct {
+					Name string   `json:"name"`
+					IPs  []string `json:"ips"`
+				} `json:"interfaces"`
+			}
+			if json.Unmarshal([]byte(decrypted), &sysInfo) == nil {
+				info := &NodeSystemInfo{
+					Uptime:           sysInfo.Uptime,
+					CPUUsage:         sysInfo.CPUUsage,
+					MemoryUsage:      sysInfo.MemoryUsage,
+					BytesReceived:    sysInfo.BytesReceived,
+					BytesTransmitted: sysInfo.BytesTransmitted,
+					XrayRunning:      sysInfo.XrayRunning,
+					XrayVersion:      sysInfo.XrayVersion,
+					PanelAddr:        sysInfo.PanelAddr,
+					Runtime:          sysInfo.Runtime,
+					SingBoxAudit:     sysInfo.SingBoxAudit,
+				}
+				for _, iface := range sysInfo.Interfaces {
+					info.Interfaces = append(info.Interfaces, NetInterface{
+						Name: iface.Name,
+						IPs:  iface.IPs,
+					})
+				}
+				m.nodeSystemInfo.Store(nodeId, info)
+			}
+
+			// Broadcast system info to admin sessions
+			broadcastMsg := map[string]interface{}{
+				"id":   strconv.FormatInt(nodeId, 10),
+				"type": "info",
+				"data": decrypted,
+			}
+			broadcastJSON, _ := json.Marshal(broadcastMsg)
+			m.broadcastToAdmins(string(broadcastJSON))
+		} else if containsStr(decrypted, "requestId") {
+			log.Printf("闁衡偓鐠哄搫鐓傛繛鎴濈墛娴? %s", decrypted)
+			var resp WSResponse
+			if err := json.Unmarshal([]byte(decrypted), &resp); err == nil && resp.RequestId != "" {
+				if ch, ok := m.pendingRequests.LoadAndDelete(resp.RequestId); ok {
+					result := &dto.GostResponse{
+						Msg: resp.Message,
+					}
+					if result.Msg == "" {
+						result.Msg = "OK"
+					}
+					if resp.Data != nil {
+						var dataMap interface{}
+						json.Unmarshal(resp.Data, &dataMap)
+						result.Data = dataMap
+					}
+					ch.(chan *dto.GostResponse) <- result
+				}
+			}
+		} else {
+			log.Printf("闁衡偓鐠哄搫鐓傛繛鎴濈墛娴? %s", decrypted)
+			// Broadcast to admin sessions
+			broadcastMsg := map[string]interface{}{
+				"id":   strconv.FormatInt(nodeId, 10),
+				"type": "info",
+				"data": decrypted,
+			}
+			broadcastJSON, _ := json.Marshal(broadcastMsg)
+			m.broadcastToAdmins(string(broadcastJSON))
+		}
+	}
+}
+
+func (m *WSManager) readAdminMessages(sessionId string, as *AdminSession) {
+	defer func() {
+		m.adminSessions.Delete(sessionId)
+		as.Conn.Close()
+	}()
+
+	for {
+		_, _, err := as.Conn.ReadMessage()
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (m *WSManager) SendMsg(nodeId int64, data interface{}, cmdType string) *dto.GostResponse {
+	return m.SendMsgWithTimeout(nodeId, data, cmdType, 10*time.Second)
+}
+
+func (m *WSManager) SendMsgWithTimeout(nodeId int64, data interface{}, cmdType string, timeout time.Duration) *dto.GostResponse {
+	val, ok := m.nodeSessions.Load(nodeId)
+	if !ok {
+		return &dto.GostResponse{Msg: "node offline"}
+	}
+	ns := val.(*NodeSession)
+
+	requestId := generateUUID()
+	ch := make(chan *dto.GostResponse, 1)
+	m.pendingRequests.Store(requestId, ch)
+
+	cmd := WSCommand{
+		Type:      cmdType,
+		Data:      data,
+		RequestId: requestId,
+	}
+	cmdJSON, _ := json.Marshal(cmd)
+
+	m.sendToNode(ns, string(cmdJSON))
+
+	select {
+	case result := <-ch:
+		log.Printf("闁瑰瓨鍔曟慨娑㈠矗閹达腹鍋撴担鍦ラ柟顓у灠閸╁矂鎳為崒婊冧化 %d 妤犵偠鍩栭弫褰掑礆閺夋寧鎯欓幖? %s", nodeId, result.Msg)
+		return result
+	case <-time.After(timeout):
+		m.pendingRequests.Delete(requestId)
+		log.Printf("node %d command timeout", nodeId)
+		return &dto.GostResponse{Msg: "timeout"}
+	}
+}
+
+func (m *WSManager) sendToNode(ns *NodeSession, message string) {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+
+	finalMsg := message
+	if ns.Secret != "" {
+		crypto := GetOrCreateCrypto(ns.Secret)
+		if crypto != nil {
+			encrypted, err := crypto.Encrypt(message)
+			if err == nil {
+				enc := EncryptedMessage{
+					Encrypted: true,
+					Data:      encrypted,
+					Timestamp: time.Now().UnixMilli(),
+				}
+				encJSON, _ := json.Marshal(enc)
+				finalMsg = string(encJSON)
+			}
+		}
+	}
+
+	if err := ns.Conn.WriteMessage(websocket.TextMessage, []byte(finalMsg)); err != nil {
+		log.Printf("闁告瑦鍨块埀顑跨畼ebSocket婵炴垵鐗婃导鍛緞鏉堫偉袝: %v", err)
+	}
+}
+
+func (m *WSManager) broadcastToAdmins(message string) {
+	m.adminSessions.Range(func(key, value interface{}) bool {
+		as := value.(*AdminSession)
+		as.mu.Lock()
+		as.Conn.WriteMessage(websocket.TextMessage, []byte(message))
+		as.mu.Unlock()
+		return true
+	})
+}
+
+func (m *WSManager) BroadcastMessage(message string) {
+	m.broadcastToAdmins(message)
+}
+
+func (m *WSManager) IsNodeOnline(nodeId int64) bool {
+	_, ok := m.nodeSessions.Load(nodeId)
+	return ok
+}
+
+func (m *WSManager) decryptIfNeeded(payload, secret string) string {
+	if secret == "" {
+		return payload
+	}
+	var enc EncryptedMessage
+	if err := json.Unmarshal([]byte(payload), &enc); err != nil {
+		return payload
+	}
+	if !enc.Encrypted || enc.Data == "" {
+		return payload
+	}
+	crypto := GetOrCreateCrypto(secret)
+	if crypto == nil {
+		return payload
+	}
+	decrypted, err := crypto.Decrypt(enc.Data)
+	if err != nil {
+		log.Printf("WebSocket婵炴垵鐗婃导鍛喆閿濆懐妲曞鎯扮簿鐟? %v", err)
+		return payload
+	}
+	return decrypted
+}
+
+func containsStr(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsSubstring(s, substr))
+}
+
+func containsSubstring(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+func generateUUID() string {
+	return GenerateUUIDv4()
+}
+
+func GenerateUUIDv4() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Extremely unlikely; fall back to timestamp-seeded bytes rather than crash
+		log.Printf("CRITICAL: crypto/rand failed: %v", err)
+		n := time.Now().UnixNano()
+		for i := range b {
+			b[i] = byte(n >> (i * 8))
+			n ^= n << 13
+		}
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// GenerateRandomString generates a cryptographically secure random hex string.
+func GenerateRandomString(length int) string {
+	b := make([]byte, (length+1)/2)
+	if _, err := rand.Read(b); err != nil {
+		log.Printf("CRITICAL: crypto/rand failed: %v", err)
+		n := time.Now().UnixNano()
+		for i := range b {
+			b[i] = byte(n >> (i * 8))
+			n ^= n << 13
+		}
+	}
+	hex := fmt.Sprintf("%x", b)
+	if len(hex) > length {
+		return hex[:length]
+	}
+	return hex
+}

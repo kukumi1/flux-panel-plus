@@ -1,0 +1,742 @@
+'use client';
+
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Plus, Trash2, Pause, Play, Edit2, Stethoscope, CheckCircle2, XCircle, ChevronRight, ChevronDown, LayoutGrid, TableProperties } from 'lucide-react';
+import { toast } from 'sonner';
+import { getForwardList, createForward, updateForward, deleteForward, pauseForwardService, resumeForwardService, diagnoseForward } from '@/lib/api/forward';
+import { getLatencyHistory } from '@/lib/api/monitor';
+import { userTunnel } from '@/lib/api/tunnel';
+import { getRouteList } from '@/lib/api/route';
+import { getAccessibleNodeList } from '@/lib/api/node';
+import { useAuth } from '@/lib/hooks/use-auth';
+import { useTranslation } from '@/lib/i18n';
+
+export default function ForwardPage() {
+  const { isAdmin, gostEnabled, username } = useAuth();
+  const { t } = useTranslation();
+  const [forwards, setForwards] = useState<any[]>([]);
+  const [tunnels, setTunnels] = useState<any[]>([]);
+  const [routes, setRoutes] = useState<any[]>([]);
+  const [nodes, setNodes] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [editingForward, setEditingForward] = useState<any>(null);
+  const [form, setForm] = useState({ name: '', targetMode: 'tunnel', tunnelId: '', routeId: '', remoteAddr: '', inPort: '', listenIp: '', strategy: 'round', interfaceName: '' });
+  const [filterTarget, setFilterTarget] = useState('');
+  const [diagnoseDialogOpen, setDiagnoseDialogOpen] = useState(false);
+  const [diagnoseResult, setDiagnoseResult] = useState<any>(null);
+  const [diagnosing, setDiagnosing] = useState<number | null>(null);
+  const [latencyMap, setLatencyMap] = useState<Record<number, { latency: number; success: boolean } | null>>({});
+  const initialLoad = useRef(true);
+
+  // Collapsible group state. Undefined means "use default for current view mode".
+  const [groupCollapsed, setGroupCollapsed] = useState<Record<string, boolean>>({});
+
+  // Card/Table view toggle
+  const [viewMode, setViewMode] = useState<'card' | 'table'>(() => {
+    if (typeof window !== 'undefined') {
+      return (localStorage.getItem('forward_view') as 'card' | 'table') || 'table';
+    }
+    return 'table';
+  });
+
+  // Admin/User tab
+  const [activeTab, setActiveTab] = useState<'admin' | 'user'>('admin');
+
+  const handleViewMode = (mode: 'card' | 'table') => {
+    setViewMode(mode);
+    localStorage.setItem('forward_view', mode);
+  };
+
+  const isGroupCollapsed = (groupKey: string, defaultCollapsed: boolean) => {
+    const state = groupCollapsed[groupKey];
+    return state === undefined ? defaultCollapsed : state;
+  };
+
+  const toggleCollapse = (groupKey: string, defaultCollapsed: boolean) => {
+    setGroupCollapsed(prev => {
+      const current = prev[groupKey];
+      const currentValue = current === undefined ? defaultCollapsed : current;
+      return { ...prev, [groupKey]: !currentValue };
+    });
+  };
+
+  const loadLatency = useCallback(async (fwds: any[]) => {
+    const active = fwds.filter((f: any) => f.status === 1);
+    if (active.length === 0) { setLatencyMap({}); return; }
+    const results = await Promise.all(
+      active.map(async (f: any) => {
+        try {
+          const res = await getLatencyHistory(f.id, 1);
+          if (res.code === 0 && res.data && (res.data as any[]).length > 0) {
+            const records = res.data as any[];
+            const last = records[records.length - 1];
+            return { id: f.id, latency: last.latency, success: last.success };
+          }
+        } catch {}
+        return { id: f.id, latency: 0, success: false };
+      })
+    );
+    const map: Record<number, { latency: number; success: boolean }> = {};
+    for (const r of results) {
+      map[r.id] = { latency: r.latency, success: r.success };
+    }
+    setLatencyMap(map);
+  }, []);
+
+  const loadData = useCallback(async () => {
+    if (initialLoad.current) setLoading(true);
+    const [forwardRes, tunnelRes, nodeRes, routeRes] = await Promise.all([
+      getForwardList(),
+      userTunnel(),
+      getAccessibleNodeList({ gostOnly: true }),
+      isAdmin ? getRouteList() : Promise.resolve({ code: 0, data: [] }),
+    ]);
+    const fwds = forwardRes.code === 0 ? (forwardRes.data || []) : [];
+    if (forwardRes.code === 0) setForwards(fwds);
+    if (tunnelRes.code === 0) setTunnels(tunnelRes.data || []);
+    if (nodeRes.code === 0) setNodes(nodeRes.data || []);
+    if (routeRes.code === 0) setRoutes(routeRes.data || []);
+    setLoading(false);
+    initialLoad.current = false;
+    loadLatency(fwds);
+  }, [isAdmin, loadLatency]);
+
+  useEffect(() => { loadData(); }, [loadData]);
+
+  // Auto-refresh every 30 seconds
+  useEffect(() => {
+    const timer = setInterval(() => { loadData(); }, 30000);
+    return () => clearInterval(timer);
+  }, [loadData]);
+
+  const handleCreate = () => {
+    setEditingForward(null);
+    setForm({ name: '', targetMode: 'tunnel', tunnelId: '', routeId: '', remoteAddr: '', inPort: '', listenIp: '::', strategy: 'round', interfaceName: '' });
+    setDialogOpen(true);
+  };
+
+  const handleEdit = (forward: any) => {
+    setEditingForward(forward);
+    setForm({
+      name: forward.name,
+      targetMode: forward.routeId ? 'route' : 'tunnel',
+      tunnelId: forward.tunnelId?.toString() || '',
+      routeId: forward.routeId?.toString() || '',
+      remoteAddr: forward.remoteAddr?.includes(',') ? forward.remoteAddr.split(',').join('\n') : (forward.remoteAddr || ''),
+      inPort: forward.inPort?.toString() || '',
+      listenIp: forward.listenIp || '::',
+      strategy: forward.strategy || 'round',
+      interfaceName: forward.interfaceName || '',
+    });
+    setDialogOpen(true);
+  };
+
+  const handleSubmit = async () => {
+    if (!form.name || !form.remoteAddr || (form.targetMode === 'tunnel' && !form.tunnelId) || (form.targetMode === 'route' && !form.routeId)) {
+      toast.error(t('common.fillRequired'));
+      return;
+    }
+    const data: any = {
+      name: form.name,
+      remoteAddr: form.remoteAddr.split('\n').map(s => s.trim()).filter(Boolean).join(','),
+      listenIp: form.listenIp || undefined,
+      strategy: form.strategy,
+      interfaceName: form.interfaceName || null,
+    };
+    if (form.targetMode === 'route') data.routeId = parseInt(form.routeId);
+    else data.tunnelId = parseInt(form.tunnelId);
+    if (form.inPort) data.inPort = parseInt(form.inPort);
+
+    let res;
+    if (editingForward) {
+      res = await updateForward({ ...data, id: editingForward.id });
+    } else {
+      res = await createForward(data);
+    }
+
+    if (res.code === 0) {
+      toast.success(editingForward ? t('common.updateSuccess') : t('common.createSuccess'));
+      setDialogOpen(false);
+      loadData();
+    } else {
+      toast.error(res.msg);
+    }
+  };
+
+  const handleDelete = async (id: number) => {
+    if (!confirm(t('forward.confirmDelete'))) return;
+    const res = await deleteForward(id);
+    if (res.code === 0) { toast.success(t('common.deleteSuccess')); loadData(); }
+    else toast.error(res.msg);
+  };
+
+  const handlePause = async (id: number) => {
+    const res = await pauseForwardService(id);
+    if (res.code === 0) { toast.success(t('forward.pauseSuccess')); loadData(); }
+    else toast.error(res.msg);
+  };
+
+  const handleResume = async (id: number) => {
+    const res = await resumeForwardService(id);
+    if (res.code === 0) { toast.success(t('forward.resumeSuccess')); loadData(); }
+    else toast.error(res.msg);
+  };
+
+  const handleDiagnose = async (id: number) => {
+    setDiagnosing(id);
+    try {
+      const res = await diagnoseForward(id);
+      if (res.code === 0) {
+        setDiagnoseResult(res.data);
+        setDiagnoseDialogOpen(true);
+      } else {
+        toast.error(res.msg);
+      }
+    } catch {
+      toast.error(t('forward.diagnoseFailed'));
+    } finally {
+      setDiagnosing(null);
+    }
+  };
+
+  const formatBytes = (bytes: number) => {
+    if (!bytes) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
+  if (!isAdmin && !gostEnabled) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <p className="text-muted-foreground">{t('forward.noGostPermission')}</p>
+      </div>
+    );
+  }
+
+  const renderLatencyCell = (f: any) => (
+    f.status === 1 && latencyMap[f.id] ? (
+      latencyMap[f.id]!.success ? (
+        <span className={`font-mono ${latencyMap[f.id]!.latency > 500 ? 'text-red-600' : latencyMap[f.id]!.latency > 200 ? 'text-orange-600' : 'text-green-600'}`}>
+          {latencyMap[f.id]!.latency.toFixed(1)}ms
+        </span>
+      ) : (
+        <span className="text-destructive">{t('forward.timeout')}</span>
+      )
+    ) : (
+      <span className="text-muted-foreground">-</span>
+    )
+  );
+
+  const renderActionButtons = (f: any) => (
+    <div className="flex gap-1">
+      <Button variant="ghost" size="icon" onClick={() => handleEdit(f)}><Edit2 className="h-4 w-4" /></Button>
+      {f.status === 1 ? (
+        <Button variant="ghost" size="icon" onClick={() => handlePause(f.id)}><Pause className="h-4 w-4" /></Button>
+      ) : (
+        <Button variant="ghost" size="icon" onClick={() => handleResume(f.id)}><Play className="h-4 w-4" /></Button>
+      )}
+      <Button variant="ghost" size="icon" onClick={() => handleDiagnose(f.id)} disabled={diagnosing === f.id}>
+        <Stethoscope className={`h-4 w-4 ${diagnosing === f.id ? 'animate-pulse' : ''}`} />
+      </Button>
+      <Button variant="ghost" size="icon" onClick={() => handleDelete(f.id)} className="text-destructive"><Trash2 className="h-4 w-4" /></Button>
+    </div>
+  );
+
+  const renderForwardList = (list: any[], groupBy: 'tunnel' | 'user' = 'tunnel') => {
+    const isFiltered = filterTarget && filterTarget !== 'all';
+    const filtered = isFiltered
+      ? list.filter(f => {
+        const targetKey = f.routeId ? `route:${f.routeId}` : `tunnel:${f.tunnelId}`;
+        return targetKey === filterTarget;
+      })
+      : list;
+
+    if (loading) {
+      return viewMode === 'table' ? (
+        <Card>
+          <CardContent className="p-0">
+            <Table>
+              <TableBody>
+                <TableRow><TableCell colSpan={isAdmin ? 9 : 8} className="text-center py-8">{t('common.loading')}</TableCell></TableRow>
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="text-center py-8 text-muted-foreground">{t('common.loading')}</div>
+      );
+    }
+
+    if (filtered.length === 0) {
+      return viewMode === 'table' ? (
+        <Card>
+          <CardContent className="p-0">
+            <Table>
+              <TableBody>
+                <TableRow><TableCell colSpan={isAdmin ? 9 : 8} className="text-center py-8 text-muted-foreground">{t('common.noData')}</TableCell></TableRow>
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="text-center py-8 text-muted-foreground">{t('common.noData')}</div>
+      );
+    }
+
+    // Group rows by selected dimension
+    const groups: Record<string, any[]> = {};
+    const groupLabels: Record<string, string> = {};
+    const order: string[] = [];
+    for (const f of filtered) {
+      let groupKey = '';
+      let groupLabel = '';
+
+      if (groupBy === 'user') {
+        const userKey = f.userId != null ? String(f.userId) : (f.userName || '-');
+        groupKey = `user:${userKey}`;
+        groupLabel = f.userName || `#${userKey}`;
+      } else {
+        groupKey = f.routeId ? `route:${f.routeId}` : `tunnel:${f.tunnelId}`;
+        groupLabel = f.routeName || f.tunnelName || groupKey;
+      }
+
+      if (!groups[groupKey]) {
+        groups[groupKey] = [];
+        groupLabels[groupKey] = groupLabel;
+        order.push(groupKey);
+      }
+      groups[groupKey].push(f);
+    }
+
+    const showGroups = groupBy === 'user' ? true : (!isFiltered && (tunnels.length + routes.length) > 1);
+    const colSpan = isAdmin ? 9 : 8;
+
+    if (viewMode === 'table') {
+      return (
+        <Card>
+          <CardContent className="p-0">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{t('forward.name')}</TableHead>
+                  {isAdmin && <TableHead>{t('forward.user')}</TableHead>}
+                  <TableHead>{t('forward.tunnel')}</TableHead>
+                  <TableHead>{t('forward.entryPort')}</TableHead>
+                  <TableHead>{t('forward.targetAddr')}</TableHead>
+                  <TableHead>{t('forward.traffic')}</TableHead>
+                  <TableHead>{t('forward.latency')}</TableHead>
+                  <TableHead>{t('forward.status')}</TableHead>
+                  <TableHead>{t('forward.actions')}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {showGroups ? (
+                  order.map(groupKey => {
+                    const groupForwards = groups[groupKey];
+                    const groupLabel = groupLabels[groupKey] || groupKey;
+                    const collapsed = isGroupCollapsed(groupKey, false);
+                    const title = groupBy === 'user'
+                      ? `${t('forward.user')}: ${groupLabel}`
+                      : groupLabel;
+                    return [
+                      <TableRow key={`group-${groupKey}`} className="bg-muted/50 hover:bg-muted/50 cursor-pointer" onClick={() => toggleCollapse(groupKey, false)}>
+                        <TableCell colSpan={colSpan} className="py-1.5 text-xs font-semibold text-muted-foreground">
+                          <div className="flex items-center gap-1">
+                            {collapsed ? <ChevronRight className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                            {title} ({groupForwards.length})
+                          </div>
+                        </TableCell>
+                      </TableRow>,
+                      ...(!collapsed ? groupForwards.map((f: any) => (
+                        <TableRow key={f.id}>
+                          <TableCell className="font-medium">{f.name}</TableCell>
+                          {isAdmin && <TableCell className="text-sm text-muted-foreground">{f.userName || '-'}</TableCell>}
+                          <TableCell>{f.tunnelName}</TableCell>
+                          <TableCell>{f.inIp}:{f.inPort}</TableCell>
+                          <TableCell className="max-w-[200px] text-sm whitespace-pre-line">{f.remoteAddr?.includes(',') ? f.remoteAddr.split(',').join('\n') : f.remoteAddr}</TableCell>
+                          <TableCell className="text-xs">{formatBytes(f.inFlow)} / {formatBytes(f.outFlow)}</TableCell>
+                          <TableCell className="text-xs">{renderLatencyCell(f)}</TableCell>
+                          <TableCell>
+                            <Badge variant={f.status === 1 ? 'default' : f.status === 0 ? 'secondary' : 'destructive'}>
+                              {f.status === 1 ? t('forward.running') : f.status === 0 ? t('forward.paused') : t('forward.error')}
+                            </Badge>
+                          </TableCell>
+                          <TableCell>{renderActionButtons(f)}</TableCell>
+                        </TableRow>
+                      )) : []),
+                    ];
+                  })
+                ) : (
+                  filtered.map((f: any) => (
+                    <TableRow key={f.id}>
+                      <TableCell className="font-medium">{f.name}</TableCell>
+                      {isAdmin && <TableCell className="text-sm text-muted-foreground">{f.userName || '-'}</TableCell>}
+                      <TableCell>{f.tunnelName}</TableCell>
+                      <TableCell>{f.inIp}:{f.inPort}</TableCell>
+                      <TableCell className="max-w-[200px] text-sm whitespace-pre-line">{f.remoteAddr?.includes(',') ? f.remoteAddr.split(',').join('\n') : f.remoteAddr}</TableCell>
+                      <TableCell className="text-xs">{formatBytes(f.inFlow)} / {formatBytes(f.outFlow)}</TableCell>
+                      <TableCell className="text-xs">{renderLatencyCell(f)}</TableCell>
+                      <TableCell>
+                        <Badge variant={f.status === 1 ? 'default' : f.status === 0 ? 'secondary' : 'destructive'}>
+                          {f.status === 1 ? t('forward.running') : f.status === 0 ? t('forward.paused') : t('forward.error')}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>{renderActionButtons(f)}</TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      );
+    }
+
+    // Card view
+    const renderCard = (f: any) => (
+      <Card key={f.id} className="flex flex-col">
+        <CardContent className="p-4 space-y-2 flex-1">
+          <div className="flex items-center justify-between">
+            <span className="font-medium text-sm truncate">{f.name}</span>
+            <Badge variant={f.status === 1 ? 'default' : f.status === 0 ? 'secondary' : 'destructive'} className="text-xs ml-2 flex-shrink-0">
+              {f.status === 1 ? t('forward.running') : f.status === 0 ? t('forward.paused') : t('forward.error')}
+            </Badge>
+          </div>
+          {isAdmin && f.userName && (
+            <div className="text-xs text-muted-foreground">{t('forward.user')}: {f.userName}</div>
+          )}
+          <div className="text-xs text-muted-foreground">{t('forward.tunnel')}: {f.tunnelName}</div>
+          <div className="text-xs font-mono">{f.inIp}:{f.inPort}</div>
+          <div className="text-xs font-mono truncate" title={f.remoteAddr}>{f.remoteAddr}</div>
+          <div className="flex items-center justify-between text-xs">
+            <span className="text-muted-foreground">{formatBytes(f.inFlow)} / {formatBytes(f.outFlow)}</span>
+            <span>{renderLatencyCell(f)}</span>
+          </div>
+          <div className="flex justify-end pt-1">
+            {renderActionButtons(f)}
+          </div>
+        </CardContent>
+      </Card>
+    );
+
+    if (showGroups) {
+      return (
+        <div className="space-y-4">
+          {order.map(groupKey => {
+            const groupForwards = groups[groupKey];
+            const groupLabel = groupLabels[groupKey] || groupKey;
+            const collapsed = isGroupCollapsed(groupKey, true);
+            const title = groupBy === 'user'
+              ? `${t('forward.user')}: ${groupLabel}`
+              : groupLabel;
+            return (
+              <div key={groupKey}>
+                <button
+                  className="flex items-center gap-1 text-sm font-semibold text-muted-foreground mb-2 hover:text-foreground"
+                  onClick={() => toggleCollapse(groupKey, true)}
+                >
+                  {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                  {title} ({groupForwards.length})
+                </button>
+                {!collapsed && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+                    {groupForwards.map(renderCard)}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+        {filtered.map(renderCard)}
+      </div>
+    );
+  };
+
+  // Compute admin vs user forward lists
+  const adminForwards = isAdmin ? forwards.filter(f => f.userName === username) : forwards;
+  const userForwards = isAdmin ? forwards.filter(f => f.userName !== username) : [];
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-2xl font-bold">{t('forward.title')}</h2>
+        <div className="flex items-center gap-2">
+          {(tunnels.length + routes.length) > 1 && (
+            <Select value={filterTarget} onValueChange={setFilterTarget}>
+              <SelectTrigger className="w-[180px]"><SelectValue placeholder={t('forward.allTunnels')} /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">{t('forward.allTunnels')}</SelectItem>
+                {tunnels.map((tun: any) => (
+                  <SelectItem key={`tunnel-${tun.id}`} value={`tunnel:${tun.id}`}>{tun.name}</SelectItem>
+                ))}
+                {routes.map((route: any) => (
+                  <SelectItem key={`route-${route.id}`} value={`route:${route.id}`}>{route.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          <div className="flex rounded-md border overflow-hidden">
+            <button
+              className={`px-3 py-1.5 text-xs flex items-center gap-1 ${viewMode === 'card' ? 'bg-primary text-primary-foreground' : 'bg-background hover:bg-muted'}`}
+              onClick={() => handleViewMode('card')}
+            >
+              <LayoutGrid className="h-3.5 w-3.5" />
+              {t('monitor.cardView')}
+            </button>
+            <button
+              className={`px-3 py-1.5 text-xs flex items-center gap-1 ${viewMode === 'table' ? 'bg-primary text-primary-foreground' : 'bg-background hover:bg-muted'}`}
+              onClick={() => handleViewMode('table')}
+            >
+              <TableProperties className="h-3.5 w-3.5" />
+              {t('monitor.tableView')}
+            </button>
+          </div>
+          <Button onClick={handleCreate}><Plus className="mr-2 h-4 w-4" />{t('forward.createForward')}</Button>
+        </div>
+      </div>
+
+      {isAdmin ? (
+        <div className="space-y-4">
+          <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as 'admin' | 'user')}>
+            <TabsList>
+              <TabsTrigger value="admin">{t('forward.adminForwards')} ({adminForwards.length})</TabsTrigger>
+              <TabsTrigger value="user">{t('forward.userForwards')} ({userForwards.length})</TabsTrigger>
+            </TabsList>
+          </Tabs>
+          {activeTab === 'admin' ? renderForwardList(adminForwards, 'tunnel') : renderForwardList(userForwards, 'user')}
+        </div>
+      ) : (
+        renderForwardList(forwards, 'tunnel')
+      )}
+
+      {/* Diagnose Dialog */}
+      <Dialog open={diagnoseDialogOpen} onOpenChange={setDiagnoseDialogOpen}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t('forward.diagnoseResult')} — {diagnoseResult?.forwardName}</DialogTitle>
+          </DialogHeader>
+          {diagnoseResult && (
+            <div className="space-y-3">
+              <div className="flex gap-2 text-sm text-muted-foreground">
+                <Badge variant="outline">{diagnoseResult.tunnelType}</Badge>
+              </div>
+              <div className="space-y-2 max-h-[60vh] overflow-y-auto pr-1">
+                {diagnoseResult.results?.map((r: any, i: number) => (
+                  <div key={i} className="rounded border p-3 space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-medium">{r.description}</span>
+                      {r.success ? (
+                        <Badge variant="default" className="gap-1"><CheckCircle2 className="h-3 w-3" />{t('forward.success')}</Badge>
+                      ) : (
+                        <Badge variant="destructive" className="gap-1"><XCircle className="h-3 w-3" />{t('forward.failed')}</Badge>
+                      )}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {r.nodeName} → {r.targetIp}:{r.targetPort}
+                    </div>
+                    {r.success ? (
+                      <div className="text-xs">
+                        {t('forward.delayMs')} <span className="font-mono">{r.averageTime.toFixed(1)}ms</span>
+                        {r.packetLoss > 0 && <span className="ml-2 text-orange-600">{t('forward.packetLoss')} {r.packetLoss.toFixed(0)}%</span>}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-destructive">{r.message}</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDiagnoseDialogOpen(false)}>{t('common.close')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{editingForward ? t('forward.editForward') : t('forward.createForward')}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label>{t('forward.name')}</Label>
+              <Input value={form.name} onChange={e => setForm(p => ({ ...p, name: e.target.value }))} placeholder={t('forward.forwardName')} />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label>{t('forward.pathType')}</Label>
+                <Select value={form.targetMode} onValueChange={v => setForm(p => ({ ...p, targetMode: v, tunnelId: v === 'route' ? '' : p.tunnelId, routeId: v === 'tunnel' ? '' : p.routeId }))}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="tunnel">{t('forward.tunnel')}</SelectItem>
+                    {isAdmin && <SelectItem value="route">{t('forward.route')}</SelectItem>}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>{form.targetMode === 'route' ? t('forward.route') : t('forward.tunnel')}</Label>
+                {form.targetMode === 'route' ? (
+                  <Select value={form.routeId} onValueChange={v => setForm(p => ({ ...p, routeId: v }))}>
+                    <SelectTrigger><SelectValue placeholder={t('forward.selectRoute')} /></SelectTrigger>
+                    <SelectContent>
+                      {routes.map((route: any) => (
+                        <SelectItem key={route.id} value={route.id.toString()}>{route.name}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <Select value={form.tunnelId} onValueChange={v => setForm(p => ({ ...p, tunnelId: v }))}>
+                    <SelectTrigger><SelectValue placeholder={t('forward.selectTunnel')} /></SelectTrigger>
+                    <SelectContent>
+                      {tunnels.map((tun: any) => (
+                        <SelectItem key={tun.id} value={tun.id.toString()}>{tun.name}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+              </div>
+            </div>
+            <div className="space-y-2">
+              <Label>{t('forward.targetAddrMultiple')} <span className="text-muted-foreground font-normal">{t('forward.targetAddrHint')}</span></Label>
+              <textarea
+                className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 font-mono"
+                value={form.remoteAddr}
+                onChange={e => setForm(p => ({ ...p, remoteAddr: e.target.value }))}
+                placeholder={"1.2.3.4:8080\n5.6.7.8:8080"}
+                rows={3}
+              />
+            </div>
+            {(() => {
+              const selectedTunnel = form.targetMode === 'tunnel' ? tunnels.find((t: any) => t.id?.toString() === form.tunnelId) : null;
+              const entryNode = selectedTunnel ? nodes.find((n: any) => n.id === selectedTunnel.inNodeId) : null;
+              const ifaces: { name: string; ips: string[] }[] = entryNode?.interfaces || [];
+              const allIps = ifaces.flatMap((iface: any) => iface.ips || []);
+              const knownValues = ['', '::', '0.0.0.0', ...allIps];
+              const isCustomListenIp = form.listenIp && !knownValues.includes(form.listenIp);
+              const nicNames = ifaces.map((iface: any) => iface.name);
+              const knownIfaceValues = [...nicNames, ...allIps];
+              const isCustomInterface = form.interfaceName && !knownIfaceValues.includes(form.interfaceName);
+
+              return (
+                <>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label>{t('forward.listenAddr')}</Label>
+                      <Select value={isCustomListenIp ? '__custom__' : (form.listenIp || '::')} onValueChange={v => {
+                        if (v === '__custom__') {
+                          setForm(p => ({ ...p, listenIp: p.listenIp || '' }));
+                        } else {
+                          setForm(p => ({ ...p, listenIp: v }));
+                        }
+                      }}>
+                        <SelectTrigger><SelectValue placeholder={t('forward.selectEntry')} /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="::">{t('forward.allInterfaces')}</SelectItem>
+                          <SelectItem value="0.0.0.0">{t('forward.ipv4Only')}</SelectItem>
+                          {ifaces.map((iface: any) =>
+                            (iface.ips || []).map((ip: string) => (
+                              <SelectItem key={`${iface.name}-${ip}`} value={ip}>
+                                {iface.name} — {ip}
+                              </SelectItem>
+                            ))
+                          )}
+                          <SelectItem value="__custom__">{t('common.custom')}</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      {isCustomListenIp && (
+                        <Input
+                          value={form.listenIp}
+                          onChange={e => setForm(p => ({ ...p, listenIp: e.target.value }))}
+                          placeholder={t('forward.ipAddrMultiple')}
+                          className="mt-1"
+                        />
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <Label>{t('forward.exitAddr')}</Label>
+                      <Select value={isCustomInterface ? '__custom__' : (form.interfaceName || '__none__')} onValueChange={v => {
+                        if (v === '__custom__') {
+                          setForm(p => ({ ...p, interfaceName: p.interfaceName || '' }));
+                        } else if (v === '__none__') {
+                          setForm(p => ({ ...p, interfaceName: '' }));
+                        } else {
+                          setForm(p => ({ ...p, interfaceName: v }));
+                        }
+                      }}>
+                        <SelectTrigger><SelectValue placeholder={t('forward.defaultRoute')} /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="__none__">{t('forward.defaultRoute')}</SelectItem>
+                          {ifaces.map((iface: any) => (
+                            <SelectItem key={`nic-${iface.name}`} value={iface.name}>
+                              {iface.name} — {t('forward.allIPs')}
+                            </SelectItem>
+                          ))}
+                          {ifaces.flatMap((iface: any) =>
+                            (iface.ips || []).map((ip: string) => (
+                              <SelectItem key={`ip-${iface.name}-${ip}`} value={ip}>
+                                {iface.name} — {ip}
+                              </SelectItem>
+                            ))
+                          )}
+                          <SelectItem value="__custom__">{t('common.custom')}</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      {isCustomInterface && (
+                        <Input
+                          value={form.interfaceName}
+                          onChange={e => setForm(p => ({ ...p, interfaceName: e.target.value }))}
+                          placeholder={t('forward.nicOrIp')}
+                          className="mt-1"
+                        />
+                      )}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label>{t('forward.entryPortOptional')}</Label>
+                      <Input value={form.inPort} onChange={e => setForm(p => ({ ...p, inPort: e.target.value }))} placeholder={t('forward.autoAssign')} />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>{t('forward.loadStrategy')}</Label>
+                      <Select value={form.strategy} onValueChange={v => setForm(p => ({ ...p, strategy: v }))}>
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="round">{t('forward.roundRobin')}</SelectItem>
+                          <SelectItem value="random">{t('forward.random')}</SelectItem>
+                          <SelectItem value="fifo">{t('forward.failover')}</SelectItem>
+                          <SelectItem value="hash">{t('forward.hash')}</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDialogOpen(false)}>{t('common.cancel')}</Button>
+            <Button onClick={handleSubmit}>{editingForward ? t('common.update') : t('common.create')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

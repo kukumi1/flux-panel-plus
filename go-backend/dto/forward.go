@@ -1,0 +1,36 @@
+package dto
+
+type ForwardDto struct {
+	Name          string `json:"name" binding:"required"`
+	TunnelId      int64  `json:"tunnelId"`
+	RouteId       int64  `json:"routeId"`
+	RemoteAddr    string `json:"remoteAddr" binding:"required"`
+	Strategy      string `json:"strategy"`
+	InPort        *int   `json:"inPort"`
+	ListenIp      string `json:"listenIp"`
+	InterfaceName string `json:"interfaceName"`
+}
+
+type ForwardUpdateDto struct {
+	ID            int64  `json:"id" binding:"required"`
+	UserId        int64  `json:"userId"`
+	Name          string `json:"name" binding:"required"`
+	TunnelId      int64  `json:"tunnelId"`
+	RouteId       int64  `json:"routeId"`
+	RemoteAddr    string `json:"remoteAddr" binding:"required"`
+	Strategy      string `json:"strategy"`
+	InPort        *int   `json:"inPort"`
+	ListenIp      string `json:"listenIp"`
+	InterfaceName string `json:"interfaceName"`
+}
+
+type ForwardOrderItem struct {
+	ID  int64 `json:"id"`
+	Inx int   `json:"inx"`
+}
+
+// OrderItem is a generic order item reused by node/tunnel order updates.
+type OrderItem struct {
+	ID  int64 `json:"id"`
+	Inx int   `json:"inx"`
+}

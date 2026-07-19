@@ -1,0 +1,18 @@
+[Unit]
+Description=x-ui xray access-log audit shipper (flux)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/xui-audit-shipper.env
+ExecStart=/usr/local/bin/xui-audit-shipper
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

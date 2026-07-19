@@ -1,0 +1,555 @@
+package service
+
+import (
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"flux-panel/go-backend/dto"
+	"flux-panel/go-backend/model"
+	"flux-panel/go-backend/pkg"
+	"log"
+	"strings"
+	"time"
+
+	"golang.org/x/crypto/curve25519"
+)
+
+// ---------------------------------------------------------------------------
+// X25519 key pair generation
+// ---------------------------------------------------------------------------
+
+func GenerateX25519KeyPair() dto.R {
+	var privKey [32]byte
+	if _, err := rand.Read(privKey[:]); err != nil {
+		return dto.Err("生成随机私钥失败")
+	}
+	// Clamping
+	privKey[0] &= 248
+	privKey[31] &= 127
+	privKey[31] |= 64
+
+	pubKey, err := curve25519.X25519(privKey[:], curve25519.Basepoint)
+	if err != nil {
+		return dto.Err("计算公钥失败")
+	}
+
+	return dto.Ok(map[string]string{
+		"privateKey": base64.RawURLEncoding.EncodeToString(privKey[:]),
+		"publicKey":  base64.RawURLEncoding.EncodeToString(pubKey),
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Xray permission helpers
+// ---------------------------------------------------------------------------
+
+func checkXrayPermission(userId int64, roleId int) *dto.R {
+	if roleId == 0 {
+		return nil // admin
+	}
+	var user model.User
+	if err := DB.First(&user, userId).Error; err != nil {
+		r := dto.Err("用户不存在")
+		return &r
+	}
+	if user.XrayEnabled != 1 {
+		r := dto.Err("无 Xray 权限")
+		return &r
+	}
+	return nil
+}
+
+func checkXrayNodeAccess(userId int64, roleId int, nodeId int64) *dto.R {
+	if roleId == 0 {
+		return nil
+	}
+	var un model.UserNode
+	err := DB.Where("user_id = ? AND node_id = ?", userId, nodeId).First(&un).Error
+	if err != nil {
+		// Check if legacy user (no user_node records at all)
+		var total int64
+		DB.Model(&model.UserNode{}).Where("user_id = ?", userId).Count(&total)
+		if total == 0 {
+			return nil // legacy user, allow all
+		}
+		r := dto.Err("无该节点的访问权限")
+		return &r
+	}
+	if un.XrayEnabled != 1 {
+		r := dto.Err("该节点未开启 Xray 权限")
+		return &r
+	}
+	return nil
+}
+
+func getUserAccessibleNodeIds(userId int64) []int64 {
+	var total int64
+	DB.Model(&model.UserNode{}).Where("user_id = ?", userId).Count(&total)
+	if total == 0 {
+		// Legacy user: return all node IDs
+		var ids []int64
+		DB.Model(&model.Node{}).Pluck("id", &ids)
+		return ids
+	}
+	var ids []int64
+	DB.Model(&model.UserNode{}).Where("user_id = ?", userId).Pluck("node_id", &ids)
+	return ids
+}
+
+func getUserAccessibleXrayNodeIds(userId int64) []int64 {
+	var total int64
+	DB.Model(&model.UserNode{}).Where("user_id = ?", userId).Count(&total)
+	if total == 0 {
+		// Legacy user: return all node IDs
+		var ids []int64
+		DB.Model(&model.Node{}).Pluck("id", &ids)
+		return ids
+	}
+	var ids []int64
+	DB.Model(&model.UserNode{}).Where("user_id = ? AND xray_enabled = 1", userId).Pluck("node_id", &ids)
+	return ids
+}
+
+// ---------------------------------------------------------------------------
+// Xray Inbound CRUD
+// ---------------------------------------------------------------------------
+
+func CreateXrayInbound(d dto.XrayInboundDto, userId int64, roleId int) dto.R {
+	if r := checkXrayPermission(userId, roleId); r != nil {
+		return *r
+	}
+	if r := checkXrayNodeAccess(userId, roleId, d.NodeId); r != nil {
+		return *r
+	}
+
+	node := GetNodeById(d.NodeId)
+	if node == nil {
+		return dto.Err("节点不存在")
+	}
+
+	// Check port conflict
+	var portCount int64
+	DB.Model(&model.XrayInbound{}).Where("node_id = ? AND port = ?", d.NodeId, d.Port).Count(&portCount)
+	if portCount > 0 {
+		return dto.Err("该节点端口已被其他入站使用")
+	}
+
+	listen := "::"
+	if d.Listen != "" {
+		listen = d.Listen
+	}
+
+	// Non-admin: bind inbound to self; admin: userId=0 (system-owned)
+	inboundUserId := int64(0)
+	if roleId != 0 {
+		inboundUserId = userId
+	}
+
+	inbound := model.XrayInbound{
+		NodeId:             d.NodeId,
+		UserId:             inboundUserId,
+		Tag:                d.Tag,
+		Protocol:           d.Protocol,
+		Listen:             listen,
+		Port:               d.Port,
+		SettingsJson:       d.SettingsJson,
+		StreamSettingsJson: d.StreamSettingsJson,
+		SniffingJson:       d.SniffingJson,
+		Remark:             d.Remark,
+		CustomEntry:        d.CustomEntry,
+		Enable:             1,
+		CreatedTime:        time.Now().UnixMilli(),
+		UpdatedTime:        time.Now().UnixMilli(),
+	}
+
+	if err := DB.Create(&inbound).Error; err != nil {
+		return dto.Err("创建入站失败")
+	}
+
+	// Auto-generate tag if empty
+	if inbound.Tag == "" {
+		inbound.Tag = fmt.Sprintf("inbound-%d", inbound.ID)
+		DB.Model(&inbound).Update("tag", inbound.Tag)
+	}
+
+	// Hot add inbound (no Xray restart needed)
+	inbound.SettingsJson = mergeClientsIntoSettings(&inbound)
+	result := pkg.XrayAddInbound(node.ID, &inbound)
+	if result != nil && result.Msg != "OK" {
+		// If Xray is not installed, keep the DB record — user can install Xray
+		// and then reconcile to deploy
+		if strings.Contains(result.Msg, "未安装") {
+			log.Printf("[XrayInbound] Xray not installed on node %d, inbound saved but not deployed", node.ID)
+			return dto.Warn("入站已保存，但 "+result.Msg+"。安装后请同步配置以部署。", inbound)
+		}
+		DB.Model(&inbound).Update("enable", -1)
+		return dto.Err("Xray 热加载入站失败: " + result.Msg)
+	}
+
+	return dto.Ok(inbound)
+}
+
+func ListXrayInbounds(nodeId *int64, userId int64, roleId int) dto.R {
+	if r := checkXrayPermission(userId, roleId); r != nil {
+		return *r
+	}
+
+	query := DB.Model(&model.XrayInbound{}).Order("created_time DESC")
+	if nodeId != nil {
+		if r := checkXrayNodeAccess(userId, roleId, *nodeId); r != nil {
+			return *r
+		}
+		query = query.Where("node_id = ?", *nodeId)
+	} else if roleId != 0 {
+		// Non-admin without nodeId filter: restrict to Xray-accessible nodes
+		nodeIds := getUserAccessibleXrayNodeIds(userId)
+		query = query.Where("node_id IN ?", nodeIds)
+	}
+
+	if roleId != 0 {
+		// Non-admin: only see own inbounds OR inbounds that contain own clients
+		query = query.Where("user_id = ? OR id IN (?)",
+			userId,
+			DB.Model(&model.XrayClient{}).Select("DISTINCT inbound_id").Where("user_id = ?", userId))
+	}
+
+	var list []model.XrayInbound
+	query.Find(&list)
+
+	// Build client count map
+	type countRow struct {
+		InboundId   int64
+		ClientCount int
+	}
+	var counts []countRow
+	countQuery := DB.Model(&model.XrayClient{}).Select("inbound_id, COUNT(*) as client_count").Group("inbound_id")
+	if roleId != 0 {
+		// Non-admin: only count own clients
+		countQuery = countQuery.Where("user_id = ?", userId)
+	}
+	countQuery.Find(&counts)
+	countMap := make(map[int64]int, len(counts))
+	for _, c := range counts {
+		countMap[c.InboundId] = c.ClientCount
+	}
+
+	// Resolve userName map for the inbounds' owners
+	ownerIds := make([]int64, 0, len(list))
+	seen := make(map[int64]struct{}, len(list))
+	for _, ib := range list {
+		if _, ok := seen[ib.UserId]; !ok {
+			seen[ib.UserId] = struct{}{}
+			ownerIds = append(ownerIds, ib.UserId)
+		}
+	}
+	userNameMap := make(map[int64]string, len(ownerIds))
+	if len(ownerIds) > 0 {
+		var owners []model.User
+		DB.Select("id, `user`").Where("id IN ?", ownerIds).Find(&owners)
+		for _, u := range owners {
+			userNameMap[u.ID] = u.User
+		}
+	}
+
+	// Build response with client count and ownership flag
+	result := make([]map[string]interface{}, 0, len(list))
+	for _, ib := range list {
+		isOwner := roleId == 0 || ib.UserId == userId
+		result = append(result, map[string]interface{}{
+			"id":                 ib.ID,
+			"nodeId":             ib.NodeId,
+			"userId":             ib.UserId,
+			"userName":           userNameMap[ib.UserId],
+			"tag":                ib.Tag,
+			"protocol":           ib.Protocol,
+			"listen":             ib.Listen,
+			"port":               ib.Port,
+			"settingsJson":       ib.SettingsJson,
+			"streamSettingsJson": ib.StreamSettingsJson,
+			"sniffingJson":       ib.SniffingJson,
+			"remark":             ib.Remark,
+			"customEntry":        ib.CustomEntry,
+			"enable":             ib.Enable,
+			"createdTime":        ib.CreatedTime,
+			"updatedTime":        ib.UpdatedTime,
+			"clientCount":        countMap[ib.ID],
+			"isOwner":            isOwner,
+		})
+	}
+	return dto.Ok(result)
+}
+
+func UpdateXrayInbound(d dto.XrayInboundUpdateDto, userId int64, roleId int) dto.R {
+	if r := checkXrayPermission(userId, roleId); r != nil {
+		return *r
+	}
+
+	var existing model.XrayInbound
+	if err := DB.First(&existing, d.ID).Error; err != nil {
+		return dto.Err("入站不存在")
+	}
+
+	if r := checkXrayNodeAccess(userId, roleId, existing.NodeId); r != nil {
+		return *r
+	}
+
+	// Non-admin: must own this inbound
+	if roleId != 0 && existing.UserId != userId {
+		return dto.Err("无权操作此入站")
+	}
+
+	// Port conflict check
+	if d.Port != nil && *d.Port != existing.Port {
+		var portCount int64
+		DB.Model(&model.XrayInbound{}).Where("node_id = ? AND port = ? AND id != ?", existing.NodeId, *d.Port, d.ID).Count(&portCount)
+		if portCount > 0 {
+			return dto.Err("该节点端口已被其他入站使用")
+		}
+	}
+
+	// Save old state before updating (for rollback on sync failure)
+	oldInbound := existing
+
+	updates := map[string]interface{}{"updated_time": time.Now().UnixMilli()}
+	if d.Tag != "" {
+		updates["tag"] = d.Tag
+	}
+	if d.Protocol != "" {
+		updates["protocol"] = d.Protocol
+	}
+	if d.Listen != "" {
+		updates["listen"] = d.Listen
+	}
+	if d.Port != nil {
+		updates["port"] = *d.Port
+	}
+	if d.SettingsJson != "" {
+		updates["settings_json"] = d.SettingsJson
+	}
+	if d.StreamSettingsJson != "" {
+		updates["stream_settings_json"] = d.StreamSettingsJson
+	}
+	if d.SniffingJson != "" {
+		updates["sniffing_json"] = d.SniffingJson
+	}
+	if d.Remark != "" {
+		updates["remark"] = d.Remark
+	}
+	if d.CustomEntry != nil {
+		updates["custom_entry"] = *d.CustomEntry
+	}
+
+	DB.Model(&existing).Updates(updates)
+
+	// Reload the updated inbound from DB
+	DB.First(&existing, d.ID)
+
+	// Skip hot operations for disabled inbounds (not running in Xray)
+	if oldInbound.Enable == 0 {
+		return dto.Ok("更新成功")
+	}
+
+	// Hot update: remove old inbound + add updated inbound (no Xray restart needed)
+	removeResult := pkg.XrayRemoveInbound(existing.NodeId, oldInbound.Tag)
+	if removeResult != nil && removeResult.Msg != "OK" {
+		// Revert DB to old state
+		DB.Save(&oldInbound)
+		return dto.Err("Xray 热移除旧入站失败，已回退: " + removeResult.Msg)
+	}
+
+	existing.SettingsJson = mergeClientsIntoSettings(&existing)
+	addResult := pkg.XrayAddInbound(existing.NodeId, &existing)
+	if addResult != nil && addResult.Msg != "OK" {
+		// Re-add old inbound and revert DB
+		oldInbound.SettingsJson = mergeClientsIntoSettings(&oldInbound)
+		pkg.XrayAddInbound(oldInbound.NodeId, &oldInbound)
+		DB.Save(&oldInbound)
+		return dto.Err("Xray 热加载新入站失败，已回退: " + addResult.Msg)
+	}
+
+	return dto.Ok("更新成功")
+}
+
+func DeleteXrayInbound(id int64, userId int64, roleId int) dto.R {
+	if r := checkXrayPermission(userId, roleId); r != nil {
+		return *r
+	}
+
+	var inbound model.XrayInbound
+	if err := DB.First(&inbound, id).Error; err != nil {
+		return dto.Err("入站不存在")
+	}
+
+	if r := checkXrayNodeAccess(userId, roleId, inbound.NodeId); r != nil {
+		return *r
+	}
+
+	// Non-admin: must own this inbound
+	if roleId != 0 && inbound.UserId != userId {
+		return dto.Err("无权操作此入站")
+	}
+
+	// Hot remove inbound (skip if node is offline — services aren't running)
+	if pkg.WS != nil && pkg.WS.IsNodeOnline(inbound.NodeId) {
+		result := pkg.XrayRemoveInbound(inbound.NodeId, inbound.Tag)
+		if result != nil && result.Msg != "OK" {
+			return dto.Err("Xray 热移除入站失败: " + result.Msg)
+		}
+	}
+
+	// Delete associated clients from DB
+	DB.Where("inbound_id = ?", id).Delete(&model.XrayClient{})
+
+	DB.Delete(&inbound)
+
+	// If no enabled inbounds remain on this node, stop Xray
+	var remaining int64
+	DB.Model(&model.XrayInbound{}).Where("node_id = ? AND enable = 1", inbound.NodeId).Count(&remaining)
+	if remaining == 0 {
+		log.Printf("[XrayInbound] 节点 %d 无剩余入站，自动停止 Xray", inbound.NodeId)
+		pkg.XrayStop(inbound.NodeId)
+	}
+
+	return dto.Ok("删除成功")
+}
+
+func EnableXrayInbound(id int64, userId int64, roleId int) dto.R {
+	if r := checkXrayPermission(userId, roleId); r != nil {
+		return *r
+	}
+
+	var inbound model.XrayInbound
+	if err := DB.First(&inbound, id).Error; err != nil {
+		return dto.Err("入站不存在")
+	}
+
+	if r := checkXrayNodeAccess(userId, roleId, inbound.NodeId); r != nil {
+		return *r
+	}
+
+	// Non-admin: must own this inbound
+	if roleId != 0 && inbound.UserId != userId {
+		return dto.Err("无权操作此入站")
+	}
+
+	DB.Model(&inbound).Updates(map[string]interface{}{
+		"enable":       1,
+		"updated_time": time.Now().UnixMilli(),
+	})
+
+	// Hot add inbound (no Xray restart needed)
+	DB.First(&inbound, id)
+	inbound.SettingsJson = mergeClientsIntoSettings(&inbound)
+	result := pkg.XrayAddInbound(inbound.NodeId, &inbound)
+	if result != nil && result.Msg != "OK" {
+		// Revert
+		DB.Model(&inbound).Updates(map[string]interface{}{
+			"enable":       0,
+			"updated_time": time.Now().UnixMilli(),
+		})
+		return dto.Err("Xray 热加载入站失败，启用已回退: " + result.Msg)
+	}
+	return dto.Ok("已启用")
+}
+
+func DisableXrayInbound(id int64, userId int64, roleId int) dto.R {
+	if r := checkXrayPermission(userId, roleId); r != nil {
+		return *r
+	}
+
+	var inbound model.XrayInbound
+	if err := DB.First(&inbound, id).Error; err != nil {
+		return dto.Err("入站不存在")
+	}
+
+	if r := checkXrayNodeAccess(userId, roleId, inbound.NodeId); r != nil {
+		return *r
+	}
+
+	// Non-admin: must own this inbound
+	if roleId != 0 && inbound.UserId != userId {
+		return dto.Err("无权操作此入站")
+	}
+
+	// Hot remove inbound (no Xray restart needed)
+	result := pkg.XrayRemoveInbound(inbound.NodeId, inbound.Tag)
+	if result != nil && result.Msg != "OK" {
+		return dto.Err("Xray 热移除入站失败，禁用已回退: " + result.Msg)
+	}
+
+	DB.Model(&inbound).Updates(map[string]interface{}{
+		"enable":       0,
+		"updated_time": time.Now().UnixMilli(),
+	})
+
+	// If no enabled inbounds remain on this node, stop Xray
+	var remaining int64
+	DB.Model(&model.XrayInbound{}).Where("node_id = ? AND enable = 1", inbound.NodeId).Count(&remaining)
+	if remaining == 0 {
+		log.Printf("[XrayInbound] 节点 %d 无剩余启用入站，自动停止 Xray", inbound.NodeId)
+		pkg.XrayStop(inbound.NodeId)
+	}
+
+	return dto.Ok("已禁用")
+}
+
+func mergeClientsIntoSettings(inbound *model.XrayInbound) string {
+	var settings map[string]interface{}
+	if err := json.Unmarshal([]byte(inbound.SettingsJson), &settings); err != nil {
+		settings = map[string]interface{}{}
+	}
+
+	// Read method for shadowsocks (Xray requires each client to have its own method)
+	ssMethod, _ := settings["method"].(string)
+
+	var clients []model.XrayClient
+	DB.Where("inbound_id = ? AND enable = 1", inbound.ID).Find(&clients)
+
+	clientArr := []map[string]interface{}{}
+	for _, c := range clients {
+		obj := map[string]interface{}{"email": c.Email, "level": 0}
+		switch inbound.Protocol {
+		case "vmess":
+			obj["id"] = c.UuidOrPassword
+			obj["alterId"] = c.AlterId
+		case "vless":
+			obj["id"] = c.UuidOrPassword
+			obj["flow"] = c.Flow
+		case "trojan":
+			obj["password"] = c.UuidOrPassword
+		case "shadowsocks":
+			obj["password"] = c.UuidOrPassword
+			if ssMethod != "" {
+				if strings.HasPrefix(ssMethod, "2022-blake3-") {
+					obj["method"] = ""
+				} else {
+					obj["method"] = ssMethod
+				}
+			}
+		}
+		clientArr = append(clientArr, obj)
+	}
+	settings["clients"] = clientArr
+
+	result, _ := json.Marshal(settings)
+	return string(result)
+}
+
+func syncXrayNodeConfig(nodeId int64) string {
+	if nodeId <= 0 {
+		return ""
+	}
+	var inbounds []model.XrayInbound
+	DB.Where("node_id = ? AND enable = 1", nodeId).Find(&inbounds)
+	// Merge clients into settingsJson before sending to node
+	for i := range inbounds {
+		inbounds[i].SettingsJson = mergeClientsIntoSettings(&inbounds[i])
+	}
+	result := pkg.XrayApplyConfig(nodeId, inbounds)
+	if result != nil && result.Msg != "OK" {
+		log.Printf("全量同步 Xray 配置到节点 %d 失败: %s", nodeId, result.Msg)
+		return result.Msg
+	}
+	return ""
+}

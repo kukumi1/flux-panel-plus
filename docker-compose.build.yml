@@ -1,0 +1,20 @@
+services:
+  node-binary-init:
+    build:
+      context: ./go-node
+      dockerfile: Dockerfile.binary
+      args:
+        VERSION: ${FLUX_VERSION:-dev}
+    image: flux-panel-plus/node-binary:${FLUX_VERSION:-dev}
+
+  backend:
+    build:
+      context: ./go-backend
+      args:
+        VERSION: ${FLUX_VERSION:-dev}
+    image: flux-panel-plus/backend:${FLUX_VERSION:-dev}
+
+  frontend:
+    build:
+      context: ./nextjs-frontend
+    image: flux-panel-plus/frontend:${FLUX_VERSION:-dev}

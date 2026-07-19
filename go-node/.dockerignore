@@ -1,0 +1,10 @@
+.git
+*.exe
+*.test
+*.out
+node
+node-*
+ss
+.next
+config.json
+runtime.json

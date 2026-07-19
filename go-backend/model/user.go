@@ -1,0 +1,30 @@
+package model
+
+type User struct {
+	ID            int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	User          string `gorm:"column:user" json:"user"`
+	Pwd           string `gorm:"column:pwd" json:"pwd"`
+	RoleId        int    `gorm:"column:role_id" json:"roleId"`
+	ExpTime       int64  `gorm:"column:exp_time" json:"expTime"`
+	Flow          int64  `gorm:"column:flow" json:"flow"`
+	InFlow        int64  `gorm:"column:in_flow" json:"inFlow"`
+	OutFlow       int64  `gorm:"column:out_flow" json:"outFlow"`
+	XrayFlow      int64  `gorm:"column:xray_flow" json:"vFlow"`
+	XrayInFlow    int64  `gorm:"column:xray_in_flow" json:"vInFlow"`
+	XrayOutFlow   int64  `gorm:"column:xray_out_flow" json:"vOutFlow"`
+	FlowResetTime int64  `gorm:"column:flow_reset_time" json:"flowResetTime"`
+	FlowResetType int    `gorm:"column:flow_reset_type" json:"flowResetType"`
+	FlowResetDay  int    `gorm:"column:flow_reset_day" json:"flowResetDay"`
+	Num           int    `gorm:"column:num" json:"num"`
+	GostEnabled   int    `gorm:"column:gost_enabled" json:"gostEnabled"`
+	XrayEnabled   int    `gorm:"column:xray_enabled" json:"vEnabled"`
+	SubToken      string `gorm:"column:sub_token" json:"subToken"`
+	TelegramChatId int64 `gorm:"column:telegram_chat_id" json:"telegramChatId"`
+	CreatedTime   int64  `gorm:"column:created_time" json:"createdTime"`
+	UpdatedTime   int64  `gorm:"column:updated_time" json:"updatedTime"`
+	Status        int    `gorm:"column:status" json:"status"`
+}
+
+func (User) TableName() string {
+	return "user"
+}

@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Go backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go-backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: go-backend/go.sum
+      - run: go test ./...
+      - run: go vet ./...
+      - run: go build -trimpath -buildvcs=false ./...
+
+  node:
+    name: Go node
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: |
+            go-node/go.sum
+      - name: Test node module
+        working-directory: go-node
+        run: go test ./...
+      - name: Vet node module
+        working-directory: go-node
+        run: go vet ./...
+
+  audit-shipper:
+    name: x-ui audit shipper
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: xui-audit-shipper
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: xui-audit-shipper/go.sum
+      - run: go test ./...
+      - run: go vet ./...
+
+  frontend:
+    name: Next.js frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nextjs-frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: nextjs-frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  repository:
+    name: Repository checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release version
+        run: |
+          test -s VERSION
+          test "$(cat VERSION)" = "$(node -p "require('./nextjs-frontend/package.json').version")"
+      - name: Validate shell scripts
+        run: bash -n panel_install.sh install.sh
+      - name: Reject committed local secrets
+        run: |
+          test ! -e .env
+          ! git ls-files | grep -E '(^|/)(id_rsa|id_ed25519|.*\.(pem|key|p12|pfx)|database_backup_.*\.sql)$'

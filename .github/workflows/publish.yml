@@ -1,0 +1,146 @@
+name: Publish images and releases
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            expected="$(cat VERSION)"
+            [[ "${version}" == "${expected}" ]] || {
+              echo "Tag ${version} does not match VERSION ${expected}" >&2
+              exit 1
+            }
+          else
+            version="main-${short_sha}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
+
+  images:
+    name: Publish ${{ matrix.component }} image
+    needs: metadata
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: backend
+            context: go-backend
+            dockerfile: go-backend/Dockerfile
+          - component: frontend
+            context: nextjs-frontend
+            dockerfile: nextjs-frontend/Dockerfile
+          - component: node
+            context: go-node
+            dockerfile: go-node/Dockerfile
+          - component: node-binary
+            context: go-node
+            dockerfile: go-node/Dockerfile.binary
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: image
+        shell: bash
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          SHORT_SHA: ${{ needs.metadata.outputs.short_sha }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY}/${COMPONENT}"
+          image="${image,,}"
+          {
+            echo 'tags<<EOF'
+            echo "${image}:${VERSION}"
+            echo "${image}:sha-${SHORT_SHA}"
+            echo "${image}:latest"
+            echo EOF
+          } >> "${GITHUB_OUTPUT}"
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.image.outputs.tags }}
+          build-args: |
+            VERSION=${{ needs.metadata.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+  release:
+    name: Create GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [metadata, images]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: |
+            go-backend/go.sum
+            go-node/go.sum
+            xui-audit-shipper/go.sum
+      - name: Build release binaries
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          mkdir -p dist
+          (
+            cd go-backend
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w -X flux-panel/go-backend/pkg.Version=${VERSION}" -o ../dist/backend-linux-amd64 .
+            CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w -X flux-panel/go-backend/pkg.Version=${VERSION}" -o ../dist/backend-linux-arm64 .
+          )
+          (
+            cd go-node
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.nodeVersion=${VERSION}" -o ../dist/node-linux-amd64 .
+            CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.nodeVersion=${VERSION}" -o ../dist/node-linux-arm64 .
+          )
+          (
+            cd xui-audit-shipper
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -o ../dist/xui-audit-shipper-linux-amd64 .
+            CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -o ../dist/xui-audit-shipper-linux-arm64 .
+          )
+          cp docker-compose.yml docker-compose.build.yml panel_install.sh install.sh dist/
+          cp .env.example dist/env.example
+          (
+            cd dist
+            sha256sum backend-* node-* xui-audit-shipper-* docker-compose.yml docker-compose.build.yml panel_install.sh install.sh env.example > SHA256SUMS
+          )
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release view "${tag}" >/dev/null 2>&1 || \
+            gh release create "${tag}" --title "Flux Panel Plus ${tag}" --generate-notes
+          gh release upload "${tag}" dist/* --clobber
