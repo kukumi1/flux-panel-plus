@@ -1539,6 +1539,13 @@ func createRouteGostServices(forward *model.Forward, route *model.Route, hops []
 	return ""
 }
 
+// nodeOnline reports whether the panel holds a live session for the node.
+// A node that is offline or already deleted runs no GOST services, so callers
+// cleaning up remote state can safely skip it.
+func nodeOnline(nodeId int64) bool {
+	return pkg.WS != nil && pkg.WS.IsNodeOnline(nodeId)
+}
+
 func cleanupRouteForwardServices(forward *model.Forward) string {
 	if forward.RouteId == 0 {
 		return ""
@@ -1548,11 +1555,16 @@ func cleanupRouteForwardServices(forward *model.Forward) string {
 	serviceName := buildServiceName(forward.ID, forward.UserId, nil)
 
 	if len(hops) > 0 {
-		entryResult := pkg.DeleteRouteServices(hops[0].NodeId, []string{serviceName + "_tcp", serviceName + "_udp"})
-		if errMsg := gostDeleteError(entryResult); errMsg != "" {
-			return errMsg
+		if nodeOnline(hops[0].NodeId) {
+			entryResult := pkg.DeleteRouteServices(hops[0].NodeId, []string{serviceName + "_tcp", serviceName + "_udp"})
+			if errMsg := gostDeleteError(entryResult); errMsg != "" {
+				return errMsg
+			}
 		}
 		for i := 0; i < len(hops)-1; i++ {
+			if !nodeOnline(hops[i].NodeId) {
+				continue
+			}
 			chainResult := pkg.DeleteRouteChain(hops[i].NodeId, routeChainName(serviceName, i))
 			if errMsg := gostDeleteError(chainResult); errMsg != "" {
 				return errMsg
@@ -1560,6 +1572,9 @@ func cleanupRouteForwardServices(forward *model.Forward) string {
 		}
 	}
 	for _, port := range ports {
+		if !nodeOnline(port.NodeId) {
+			continue
+		}
 		serviceResult := pkg.DeleteRouteServices(port.NodeId, []string{routeRelayServiceName(serviceName, port.HopOrder)})
 		if errMsg := gostDeleteError(serviceResult); errMsg != "" {
 			return errMsg
